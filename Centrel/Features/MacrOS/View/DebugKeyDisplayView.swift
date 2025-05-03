@@ -100,7 +100,14 @@ struct DebugKeyDisplayView: View {
                     .tint(controller.useSimulation ? .red : .blue)
                     .controlSize(.small)
                 }
+                
+                Button("Log Macros") {
+                    controller.logStoredMacros()
+                }
+                .font(.caption)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
         }
     }
-} 
+}

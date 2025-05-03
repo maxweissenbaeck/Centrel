@@ -49,6 +49,11 @@ class MacroController {
         
         // Try to setup monitoring immediately to test permission
         trySetupMonitoring()
+        // If permission was already granted during setup, install global monitors now
+        if permissionGranted {
+            logger.info("🔍 Permission already granted on init; installing global monitors")
+            startMonitoring()
+        }
         
         // Start a timer to periodically check permission status
         checkTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
@@ -71,7 +76,6 @@ class MacroController {
         // Log immediately after setting the context and refreshing
         if isDebugging {
             logger.info("ModelContext set and macros refreshed")
-            logStoredMacros()
         }
     }
     
@@ -88,12 +92,8 @@ class MacroController {
         do {
             let descriptor = FetchDescriptor<Macro>()
             self.macros = try modelContext.fetch(descriptor)
-            print("Loaded \(self.macros.count) macros for trigger detection")
-            
-            // Log the macros if debugging is enabled
-            if isDebugging {
-                logStoredMacros()
-            }
+            //print("Loaded \(self.macros.count) macros for trigger detection")
+        
         } catch {
             print("Failed to load macros: \(error)")
             logger.error("Failed to load macros: \(error.localizedDescription)")
@@ -144,10 +144,9 @@ class MacroController {
                 hasShownPermissionBanner = true
                 errorMessage = nil
                 
-                // Now that we know we have permission, start monitoring if needed
-                if isDebugging || isRecording {
-                    startMonitoring()
-                }
+                // Now that we know we have permission, install global monitors
+                logger.info("🔍 Verified permission by monitoring; installing global monitors")
+                startMonitoring()
             }
         }
     }
@@ -300,7 +299,7 @@ class MacroController {
         }
         
         isRecording = false
-        stopMonitoring()
+        // stopMonitoring() call removed to keep global monitors active
         
         // Log the recorded keys for debugging
         if isDebugging {
@@ -311,8 +310,8 @@ class MacroController {
         }
         
         // Remove the last left mouse click if it's likely the click to stop recording
-        if let lastKey = self.recordedKeys.last, 
-           lastKey.type == .mouse && 
+        if let lastKey = self.recordedKeys.last,
+           lastKey.type == .mouse &&
            lastKey.keyCode == 0 && // Left click
            lastKey.isPressed {
             
@@ -354,15 +353,13 @@ class MacroController {
             // Clear any stale pressed keys
             currentlyPressedKeys.removeAll()
         } else {
-            if !isRecording {
-                stopMonitoring()
-            }
+            // Keep global monitors running after debug mode is turned off
             stopKeySimulation()
         }
     }
     
     // Log all currently stored macros - with explicit refresh
-    private func logStoredMacros() {
+    func logStoredMacros() {
         // Force a refresh of macros from database before logging
         if let modelContext = modelContext {
             do {
@@ -461,36 +458,34 @@ class MacroController {
         isExecutingMacro = false
     }
     
-    // Method 1: The standard CGEvent method we've been using
+    // Method 1: The standard CGEvent method we've been using, now using HID injection helper
     private func executeStandardMethod(_ macro: Macro) throws {
         // Execute key events in the exact sequence they were recorded
-        for key in macro.keySequence {
+        for (index, key) in macro.keySequence.enumerated() {
             if isDebugging {
                 logger.info("▶️ Executing: \(key.displayText) (\(key.isPressed ? "DOWN" : "UP"))")
             }
-            
-            do {
-                if key.isPressed {
-                    try executeKeyDown(key, forceExecution: true)
-                    // Log success for debugging
-                    if isDebugging {
-                        logger.info("✓ Successfully posted keyDown event")
-                    }
-                } else {
-                    try executeKeyUp(key, forceExecution: true)
-                    // Log success for debugging
-                    if isDebugging {
-                        logger.info("✓ Successfully posted keyUp event")
-                    }
-                }
-                // Small delay between key events
-                usleep(20000) // 20ms between events
-            } catch {
-                logger.error("❌ Failed to execute key event: \(error.localizedDescription)")
-                errorMessage = "Failed to execute key event in macro"
-                throw error
-            }
+            // Inject the event via HID tap (pure hardware event)
+            injectHIDEvent(for: key)
+            // Brief pause between events
+            usleep(20000) // 20ms
         }
+    }
+
+    /// Injects a HID-level keyboard event for the given MacroKey.
+    private func injectHIDEvent(for key: MacroKey) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        guard let event = CGEvent(
+            keyboardEventSource: src,
+            virtualKey: CGKeyCode(key.keyCode),
+            keyDown: key.isPressed)
+        else {
+            logger.error("❌ Failed to create HID event for key \(key.displayText)")
+            return
+        }
+        // Apply recorded modifier flags directly
+        event.flags = CGEventFlags(rawValue: UInt64(key.modifiers))
+        event.post(tap: .cghidEventTap)
     }
     
     // Method 2: Try using AppleScript to simulate key presses
@@ -752,52 +747,30 @@ class MacroController {
     private func executeKeyDown(_ key: MacroKey, forceExecution: Bool) throws {
         if key.type == .keyboard {
             // Create a CGEvent for key down
-            guard let keyDownEvent = CGEvent(keyboardEventSource: CGEventSource(stateID: .combinedSessionState), 
-                                            virtualKey: CGKeyCode(key.keyCode), 
+            guard let keyDownEvent = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState),
+                                            virtualKey: CGKeyCode(key.keyCode),
                                             keyDown: true) else {
                 print("   ❌ Failed to create key down event")
                 throw MacroError.keyEventCreationFailed
             }
             
-            // Add modifiers if any
-            if key.modifiers != 0 {
-                var flags = CGEventFlags()
-                if key.modifiers & 1 != 0 { flags.insert(.maskShift) }
-                if key.modifiers & 2 != 0 { flags.insert(.maskControl) }
-                if key.modifiers & 4 != 0 { flags.insert(.maskAlternate) }
-                if key.modifiers & 8 != 0 { flags.insert(.maskCommand) }
-                keyDownEvent.flags = flags
-            }
+            // Always apply recorded modifier flags
+            var flags = CGEventFlags()
+            if key.modifiers & 1 != 0 { flags.insert(.maskShift) }
+            if key.modifiers & 2 != 0 { flags.insert(.maskControl) }
+            if key.modifiers & 4 != 0 { flags.insert(.maskAlternate) }
+            if key.modifiers & 8 != 0 { flags.insert(.maskCommand) }
+            keyDownEvent.flags = flags
             
             // Post the key down event
             print("   - Posting keyDown event")
             
             // For sandboxed apps, we need to try multiple approaches
             
-            // 1. Try to post to the event tap (requires accessibility permissions)
+            // 1. Post to the HID event tap (works for system-wide shortcuts)
             keyDownEvent.post(tap: .cghidEventTap)
             
-            // 2. Also try to use NSEvent to generate a global event
-            if forceExecution {
-                DispatchQueue.main.async {
-                    // Create a fallback NSEvent for global delivery
-                    if let keyDownNSEvent = NSEvent.keyEvent(
-                        with: .keyDown,
-                        location: NSPoint(x: 0, y: 0),
-                        modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(key.modifiers)),
-                        timestamp: ProcessInfo.processInfo.systemUptime,
-                        windowNumber: 0,
-                        context: nil,
-                        characters: "",
-                        charactersIgnoringModifiers: "",
-                        isARepeat: false,
-                        keyCode: UInt16(key.keyCode)
-                    ) {
-                        NSApp.postEvent(keyDownNSEvent, atStart: true)
-                        print("   - Also posted NSEvent keyDown")
-                    }
-                }
-            }
+            // NSEvent fallback removed
             
         } else if key.type == .mouse && forceExecution {
             // Handle mouse events if needed
@@ -834,49 +807,28 @@ class MacroController {
     private func executeKeyUp(_ key: MacroKey, forceExecution: Bool) throws {
         if key.type == .keyboard {
             // Create and post the key up event
-            guard let keyUpEvent = CGEvent(keyboardEventSource: CGEventSource(stateID: .combinedSessionState), 
-                                          virtualKey: CGKeyCode(key.keyCode), 
+            guard let keyUpEvent = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState),
+                                          virtualKey: CGKeyCode(key.keyCode),
                                           keyDown: false) else {
                 print("   ❌ Failed to create key up event")
                 throw MacroError.keyEventCreationFailed
             }
             
-            if key.modifiers != 0 {
-                var flags = CGEventFlags()
-                if key.modifiers & 1 != 0 { flags.insert(.maskShift) }
-                if key.modifiers & 2 != 0 { flags.insert(.maskControl) }
-                if key.modifiers & 4 != 0 { flags.insert(.maskAlternate) }
-                if key.modifiers & 8 != 0 { flags.insert(.maskCommand) }
-                keyUpEvent.flags = flags
-            }
+            // Always apply recorded modifier flags
+            var flags = CGEventFlags()
+            if key.modifiers & 1 != 0 { flags.insert(.maskShift) }
+            if key.modifiers & 2 != 0 { flags.insert(.maskControl) }
+            if key.modifiers & 4 != 0 { flags.insert(.maskAlternate) }
+            if key.modifiers & 8 != 0 { flags.insert(.maskCommand) }
+            keyUpEvent.flags = flags
             print("   - Posting keyUp event")
             
             // For sandboxed apps, we need to try multiple approaches
             
-            // 1. Try to post to the event tap (requires accessibility permissions)
+            // 1. Post to the HID event tap (works for system-wide shortcuts)
             keyUpEvent.post(tap: .cghidEventTap)
             
-            // 2. Also try to use NSEvent to generate a global event
-            if forceExecution {
-                DispatchQueue.main.async {
-                    // Create a fallback NSEvent for global delivery
-                    if let keyUpNSEvent = NSEvent.keyEvent(
-                        with: .keyUp,
-                        location: NSPoint(x: 0, y: 0),
-                        modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(key.modifiers)),
-                        timestamp: ProcessInfo.processInfo.systemUptime,
-                        windowNumber: 0,
-                        context: nil,
-                        characters: "",
-                        charactersIgnoringModifiers: "",
-                        isARepeat: false,
-                        keyCode: UInt16(key.keyCode)
-                    ) {
-                        NSApp.postEvent(keyUpNSEvent, atStart: true)
-                        print("   - Also posted NSEvent keyUp")
-                    }
-                }
-            }
+            // NSEvent fallback removed
             
         } else if key.type == .mouse && forceExecution {
             // Handle mouse events if needed
@@ -917,6 +869,7 @@ class MacroController {
     // MARK: - Private Methods
     
     private func startMonitoring() {
+        logger.info("🔍 Starting global monitors")
         // If already have permission, set up monitors
         if permissionGranted {
             setupGlobalMonitors()
@@ -956,22 +909,27 @@ class MacroController {
             permissionGranted = true
             hasShownPermissionBanner = true
         }
+        logger.info("✅ Global monitors installed: keyMonitor=\(self.keyMonitor != nil, privacy: .public), mouseMonitor=\(self.mouseMonitor != nil, privacy: .public), flagsMonitor=\(self.flagsMonitor != nil, privacy: .public)")
     }
     
     private func stopMonitoring() {
+        logger.info("🛑 Stopping global monitors")
         if let keyMonitor = keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
             self.keyMonitor = nil
+            logger.info("🛑 Removed keyMonitor")
         }
         
         if let mouseMonitor = mouseMonitor {
             NSEvent.removeMonitor(mouseMonitor)
             self.mouseMonitor = nil
+            logger.info("🛑 Removed mouseMonitor")
         }
         
         if let flagsMonitor = flagsMonitor {
             NSEvent.removeMonitor(flagsMonitor)
             self.flagsMonitor = nil
+            logger.info("🛑 Removed flagsMonitor")
         }
     }
     
@@ -980,33 +938,33 @@ class MacroController {
         let keyCode = event.keyCode
         let modifiers = event.modifierFlags.rawValue
         let isKeyDown = event.type == .keyDown
-        
+
         let macroKey = MacroKey(type: .keyboard, keyCode: Int(keyCode), modifiers: Int(modifiers), isPressed: isKeyDown)
-        
+
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            
+
             // Log key event in debug mode
             if self.isDebugging {
-                self.logger.info("🔑 Key \(isKeyDown ? "DOWN" : "UP"): \(macroKey.displayText) (code: \(keyCode))")
+                self.logger.info("🔑 Key \(isKeyDown ? "DOWN" : "UP"): \(macroKey.displayText) (code: \(keyCode), modifiers: \(macroKey.modifiers))")
             }
-            
+
             // Always record the key event during recording, including key up events
-                if self.isRecording {
+            if self.isRecording {
                 // Log that we're adding this key to the recorded sequence
                 if self.isDebugging {
                     self.logger.info("📝 Recording: \(macroKey.displayText) (\(isKeyDown ? "DOWN" : "UP"))")
                 }
-                
-                    self.recordedKeys.append(macroKey)
-                    
-                    // Call the callback if it exists
-                    self.onKeyRecordedCallback?(macroKey)
+
+                self.recordedKeys.append(macroKey)
+
+                // Call the callback if it exists
+                self.onKeyRecordedCallback?(macroKey)
             } else if isKeyDown {
                 // Only check for trigger on key down events
-                    self.checkForTrigger(macroKey)
-                }
-                
+                self.checkForTrigger(macroKey)
+            }
+
             if isKeyDown {
                 // Only add if it doesn't already exist
                 if !self.currentlyPressedKeys.contains(where: { $0.keyCode == macroKey.keyCode && $0.type == .keyboard }) {
@@ -1026,8 +984,8 @@ class MacroController {
         
         // Look for a matching trigger in our macros
         for macro in macros {
-            if let boundTo = macro.boundTo, 
-               boundTo.type == key.type && 
+            if let boundTo = macro.boundTo,
+               boundTo.type == key.type &&
                boundTo.keyCode == key.keyCode {
                 
                 // Also check modifiers if they exist
@@ -1038,7 +996,7 @@ class MacroController {
                     if isDebugging {
                         logger.info("🔥 TRIGGER DETECTED - Key: \(key.displayText) matches macro: \(macro.name)")
                     }
-                    
+                    logger.info("🔥 Triggering macro \"\(macro.name, privacy: .public)\" for key \(key.displayText, privacy: .public)")
                     print("🔥 TRIGGER DETECTED - Executing macro: \(macro.name)")
                     
                     // Execute the macro when triggered
@@ -1055,27 +1013,47 @@ class MacroController {
     private func handleMouseEvent(_ event: NSEvent) {
         let buttonNumber = event.buttonNumber
         let isMouseDown = [NSEvent.EventType.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type)
-        
+
+        /* Hardcoded test: if mouse button 4 is pressed, inject Option+Space
+        if isMouseDown && buttonNumber == 4 {
+            logger.info("🖱️ Hardcoded Button 4 pressed: injecting Option+Space")
+            let src = CGEventSource(stateID: .hidSystemState)
+            // Option+Space down
+            if let down = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(49), keyDown: true) {
+                down.flags = .maskAlternate
+                down.post(tap: .cghidEventTap)
+                logger.info("🔽 Hardcoded keyDown: Option+Space")
+            }
+            // Option+Space up
+            if let up = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(49), keyDown: false) {
+                up.flags = .maskAlternate
+                up.post(tap: .cghidEventTap)
+                logger.info("🔼 Hardcoded keyUp: Option+Space")
+            }
+            return
+        }*/
+
         // Create a unique identifier for the mouse event to avoid duplicate entries
         let macroKey = MacroKey(type: .mouse, keyCode: Int(buttonNumber), modifiers: Int(event.modifierFlags.rawValue), isPressed: isMouseDown)
-        
+
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            
+
             // Log mouse event in debug mode
             if self.isDebugging {
                 self.logger.info("🖱️ Mouse \(isMouseDown ? "DOWN" : "UP"): Button \(buttonNumber)")
             }
-            
+
+
             // Always record mouse events (both down and up) during recording
-                if self.isRecording {
-                        self.recordedKeys.append(macroKey)
-                        self.onKeyRecordedCallback?(macroKey)
+            if self.isRecording {
+                self.recordedKeys.append(macroKey)
+                self.onKeyRecordedCallback?(macroKey)
             } else if isMouseDown {
                 // Only check for trigger on mouse down events
-                    self.checkForTrigger(macroKey)
-                }
-                
+                self.checkForTrigger(macroKey)
+            }
+
             if isMouseDown {
                 // Add the pressed key to the current state
                 // Make sure to remove any existing entry for this button first
@@ -1130,7 +1108,7 @@ class MacroController {
         
         // Process each changed modifier
         for (keyCode, isPressed) in changedModifiers {
-            let macroKey = MacroKey(type: .keyboard, keyCode: keyCode, modifiers: 0, isPressed: isPressed)
+            let macroKey = MacroKey(type: .keyboard, keyCode: keyCode, modifiers: Int(event.modifierFlags.rawValue), isPressed: isPressed)
             
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
@@ -1167,4 +1145,4 @@ class MacroController {
         case mouseEventCreationFailed
         case unsupportedMouseButton
     }
-} 
+}

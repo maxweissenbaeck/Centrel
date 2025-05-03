@@ -1,5 +1,9 @@
 import SwiftUI
 import SwiftData
+import AppKit
+import ApplicationServices
+import IOKit.hid
+
 
 struct MacroListView: View {
     @Environment(\.modelContext) private var modelContext
@@ -9,6 +13,7 @@ struct MacroListView: View {
     @State private var showPermissionBanner = false
     @State private var refreshTrigger = false // Trigger for refreshing the UI
     @State private var newMacroID: UUID? = nil // Track newly created macro for editing
+    @State private var showPermissionChecker = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -37,6 +42,13 @@ struct MacroListView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(controller.isDebugging ? .green : .gray)
+                
+                Button(action: {
+                    showPermissionChecker = true
+                }) {
+                    Label("Permissions", systemImage: "lock.shield")
+                }
+                .buttonStyle(.bordered)
             }
             .padding()
             
@@ -119,7 +131,7 @@ struct MacroListView: View {
                     } else {
                         ForEach(macros) { macro in
                             MacroRowView(
-                                macro: macro, 
+                                macro: macro,
                                 controller: controller,
                                 isEditingName: macro.id == newMacroID,
                                 onEditComplete: {
@@ -136,6 +148,9 @@ struct MacroListView: View {
                 }
                 .id(refreshTrigger)
             }
+        }
+        .sheet(isPresented: $showPermissionChecker) {
+            PermissionCheckerView()
         }
         .onAppear {
             // Set the model context when the view appears
@@ -251,4 +266,4 @@ struct NewMacroSheet: View {
     
     return MacroListView()
         .modelContainer(container)
-} 
+}

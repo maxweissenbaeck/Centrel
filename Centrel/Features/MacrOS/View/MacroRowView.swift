@@ -247,9 +247,7 @@ struct MacroRowView: View {
         .background(Color.clear)
         .contentShape(Rectangle())
         .onChange(of: nameFieldIsFocused) { wasFocused, isFocused in
-            logger.info("Focus changed: was \(wasFocused), now \(isFocused) for macro: \(macro.name)")
             if wasFocused && !isFocused {
-                logger.info("Focus lost - calling saveName() for macro: \(macro.name)")
                 saveName()
             }
         }
