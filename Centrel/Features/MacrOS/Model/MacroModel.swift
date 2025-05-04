@@ -141,4 +141,4 @@ struct MacroKey: Codable, Hashable, Identifiable {
         default: return "Mouse Button \(buttonNumber)"
         }
     }
-} 
+}

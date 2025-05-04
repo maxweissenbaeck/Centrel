@@ -35,6 +35,8 @@ class MacroController {
     private var flagsMonitor: Any?
     private var localFlagsMonitor: Any?
     private var modelContext: ModelContext?
+    // CGEventTap for blocking real input during recording
+    private var blockingTap: CFMachPort?
     
     // Timer for simulating key presses in a sandboxed environment
     private var simulationTimer: Timer?
@@ -265,7 +267,7 @@ class MacroController {
         currentMacroName = macroName
         recordedKeys.removeAll()
         isRecording = true
-        
+        setupBlockingEventTap()
         // Log start of recording
         if isDebugging {
             logger.info("🎬 Started recording macro: \(macroName)")
@@ -280,7 +282,7 @@ class MacroController {
         
         recordedKeys.removeAll()
         isRecording = true
-        
+        setupBlockingEventTap()
         // Set up a callback for each recorded key
         self.onKeyRecordedCallback = onKeyRecorded
         
@@ -298,6 +300,7 @@ class MacroController {
             return nil
         }
         
+        removeBlockingEventTap()
         isRecording = false
         // stopMonitoring() call removed to keep global monitors active
         
@@ -934,7 +937,7 @@ class MacroController {
     }
     
     // Handle any key event - for both recording and trigger detection
-    private func handleKeyEvent(_ event: NSEvent) {
+    func handleKeyEvent(_ event: NSEvent) {
         let keyCode = event.keyCode
         let modifiers = event.modifierFlags.rawValue
         let isKeyDown = event.type == .keyDown
@@ -1010,7 +1013,7 @@ class MacroController {
     }
     
     // Handle mouse events
-    private func handleMouseEvent(_ event: NSEvent) {
+    func handleMouseEvent(_ event: NSEvent) {
         let buttonNumber = event.buttonNumber
         let isMouseDown = [NSEvent.EventType.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type)
 
@@ -1145,4 +1148,60 @@ class MacroController {
         case mouseEventCreationFailed
         case unsupportedMouseButton
     }
+    /// Install a CGEventTap that records and blocks real input events during recording
+    private func setupBlockingEventTap() {
+        guard blockingTap == nil else { return }
+        let keyDownMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+        let keyUpMask = CGEventMask(1 << CGEventType.keyUp.rawValue)
+        let flagsChangedMask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
+        let otherMouseDownMask = CGEventMask(1 << CGEventType.otherMouseDown.rawValue)
+        let otherMouseUpMask = CGEventMask(1 << CGEventType.otherMouseUp.rawValue)
+        let leftMouseDownMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+        let leftMouseUpMask = CGEventMask(1 << CGEventType.leftMouseUp.rawValue)
+        let rightMouseDownMask = CGEventMask(1 << CGEventType.rightMouseDown.rawValue)
+        let rightMouseUpMask = CGEventMask(1 << CGEventType.rightMouseUp.rawValue)
+        let mask = keyDownMask | keyUpMask | flagsChangedMask |
+                   otherMouseDownMask | otherMouseUpMask |
+                   leftMouseDownMask | leftMouseUpMask |
+                   rightMouseDownMask | rightMouseUpMask
+        let callback: CGEventTapCallBack = { proxy, type, cgEvent, refcon in
+            let controller = Unmanaged<MacroController>.fromOpaque(refcon!).takeUnretainedValue()
+            if let nsEvent = NSEvent(cgEvent: cgEvent) {
+                switch type {
+                case .keyDown, .keyUp:
+                    controller.handleKeyEvent(nsEvent)
+                case .flagsChanged:
+                    controller.handleFlagsChanged(nsEvent)
+                case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+                    controller.handleMouseEvent(nsEvent)
+                default:
+                    break
+                }
+            }
+            return nil
+        }
+        blockingTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        )
+        if let tap = blockingTap {
+            let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)!
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+    }
+
+    /// Remove the blocking tap so real input is restored
+    private func removeBlockingEventTap() {
+        if let tap = blockingTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
+            blockingTap = nil
+        }
+    }
 }
+
