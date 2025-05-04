@@ -8,13 +8,15 @@ class Macro {
     var keySequence: [MacroKey]
     var boundTo: MacroKey?
     var createdAt: Date
+    @Attribute(.externalStorage) var steps: [MacroStep] = []
     
-    init(name: String, keySequence: [MacroKey] = [], boundTo: MacroKey? = nil) {
+    init(name: String, keySequence: [MacroKey] = [], boundTo: MacroKey? = nil, steps: [MacroStep] = []) {
         self.id = UUID()
         self.name = name
         self.keySequence = keySequence
         self.boundTo = boundTo
         self.createdAt = Date()
+        self.steps = steps
     }
 }
 
@@ -48,11 +50,40 @@ struct MacroKey: Codable, Hashable, Identifiable {
         // Generate human-readable description
         switch type {
         case .keyboard:
-            let modifierDescription = Self.modifierDescription(from: modifiers)
-            let prefix = modifierDescription.isEmpty ? "" : "\(modifierDescription) + "
-            self.displayText = "\(prefix)\(Self.keyDescription(from: keyCode))"
+            // Check if this is a modifier key itself
+            if Self.isModifierKey(keyCode) {
+                // For modifier keys, just show the symbol without duplicating
+                self.displayText = Self.getCleanModifierName(keyCode)
+            } else {
+                // For regular keys, don't include modifiers in the display text
+                // (modifiers will be shown separately in the UI)
+                let keyName = Self.keyDescription(from: keyCode)
+                
+                // Use uppercase for single letter keys
+                let finalKeyName = (keyName.count == 1) ? keyName.uppercased() : keyName
+                
+                self.displayText = finalKeyName
+            }
         case .mouse:
             self.displayText = Self.mouseButtonDescription(from: keyCode)
+        }
+    }
+    
+    // Helper to check if a key is a modifier key
+    private static func isModifierKey(_ keyCode: Int) -> Bool {
+        return [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(keyCode)
+    }
+    
+    // Helper to get a clean modifier key name (just the symbol)
+    private static func getCleanModifierName(_ keyCode: Int) -> String {
+        switch keyCode {
+        case 54, 55: return "⌘"    // Command keys (both left and right)
+        case 56, 60: return "⇧"    // Shift keys
+        case 58, 61: return "⌥"    // Option keys
+        case 59, 62: return "⌃"    // Control keys
+        case 57: return "Caps Lock"
+        case 63: return "Function"
+        default: return "Key \(keyCode)"
         }
     }
     

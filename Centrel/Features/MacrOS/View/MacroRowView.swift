@@ -98,6 +98,119 @@ struct MacroRowView: View {
         return macro.keySequence.filter { $0.isPressed }
     }
     
+    // Computed property to create a readable string from macro steps
+    private var stepsDisplayText: String {
+        if !macro.steps.isEmpty {
+            // Show only clean symbols for each step
+            return macro.steps.map { step in
+                switch step.type {
+                case .key:
+                    // Get just the key symbol without any extra text
+                    let keyCode = step.keyCode ?? 0
+                    
+                    // For modifier keys, return their symbol only
+                    if keyCode >= 54 && keyCode <= 62 {
+                        // Map modifier key codes directly to symbols
+                        switch keyCode {
+                        case 54, 55: return "⌘" // Command keys
+                        case 56, 60: return "⇧" // Shift keys
+                        case 58, 61: return "⌥" // Option keys
+                        case 59, 62: return "⌃" // Control keys
+                        case 57: return "⇪"     // Caps Lock
+                        default: return ""
+                        }
+                    }
+                    
+                    // For letter/number keys with modifiers, show modifiers + key
+                    var modText = ""
+                    let mods = step.modifiers
+                    
+                    // Add modifier symbols in consistent order
+                    if mods & 1 != 0 { modText += "⇧" } // Shift
+                    if mods & 2 != 0 { modText += "⌃" } // Control
+                    if mods & 4 != 0 { modText += "⌥" } // Option/Alt
+                    if mods & 8 != 0 { modText += "⌘" } // Command
+                    
+                    // Get clean key name (just the letter/symbol)
+                    let keyName = cleanKeyName(keyCode)
+                    
+                    return modText.isEmpty ? keyName : "\(modText)\(keyName)"
+                    
+                case .mouse:
+                    // Simple mouse button display
+                    let buttonNum = step.keyCode ?? 0
+                    switch buttonNum {
+                    case 0: return "Click"
+                    case 1: return "Right Click"
+                    case 2: return "Middle Click"
+                    default: return "Button \(buttonNum)"
+                    }
+                    
+                case .text:
+                    return step.text ?? ""
+                    
+                case .delay:
+                    return "" // Don't show delays in the UI
+                }
+            }
+            .filter { !$0.isEmpty } // Remove empty entries
+            .joined(separator: " ")
+        } else {
+            // Fallback for old-style macros
+            return displayKeySequence
+                .filter { $0.isPressed }
+                .map { cleanKeyDisplay($0.displayText) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+        }
+    }
+    
+    // Helper to convert keycode to a clean key name (just the letter/symbol)
+    private func cleanKeyName(_ keyCode: Int) -> String {
+        // Map key codes to simple key names
+        let keyCodes: [Int: String] = [
+            // Letters
+            0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X",
+            8: "C", 9: "V", 11: "B", 12: "Q", 13: "W", 14: "E", 15: "R",
+            16: "Y", 17: "T", 18: "1", 19: "2", 20: "3", 21: "4", 22: "6",
+            23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8", 29: "0",
+            30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P", 36: "↩",
+            37: "L", 38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",",
+            44: "/", 45: "N", 46: "M", 47: ".", 48: "Tab", 49: "Space",
+            
+            // Common function keys
+            51: "Delete", 53: "Esc", 63: "Fn",
+            
+            // Arrows - use simple arrows
+            123: "←", 124: "→", 125: "↓", 126: "↑",
+            
+            // Function keys
+            122: "F1", 120: "F2", 99: "F3", 118: "F4", 96: "F5", 97: "F6",
+            98: "F7", 100: "F8", 101: "F9", 109: "F10", 103: "F11", 111: "F12"
+        ]
+        
+        return keyCodes[keyCode] ?? ""
+    }
+    
+    // Clean up key display by removing Left/Right and other extra text
+    private func cleanKeyDisplay(_ text: String) -> String {
+        // Remove "Left" and "Right" labels
+        var cleaned = text.replacingOccurrences(of: "Left ", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "Right ", with: "")
+        
+        // Replace full names with symbols
+        cleaned = cleaned.replacingOccurrences(of: "Command", with: "⌘")
+        cleaned = cleaned.replacingOccurrences(of: "Shift", with: "⇧")
+        cleaned = cleaned.replacingOccurrences(of: "Control", with: "⌃")
+        cleaned = cleaned.replacingOccurrences(of: "Option", with: "⌥")
+        cleaned = cleaned.replacingOccurrences(of: "Caps Lock", with: "⇪")
+        
+        // Remove " + " separator if present
+        cleaned = cleaned.replacingOccurrences(of: " + ", with: "")
+        
+        return cleaned
+    }
+    
     var body: some View {
         HStack(spacing: 16) {
             // Macro name - editable on double click
@@ -140,7 +253,7 @@ struct MacroRowView: View {
                     }
             }
             
-            // Key sequence display - click to record
+            // Key sequence - show in a readable format
             if isRecordingSequence {
                 HStack {
                     Image(systemName: "record.circle.fill")
@@ -153,11 +266,12 @@ struct MacroRowView: View {
                     setupSequenceRecording()
                 }
             } else {
-                Text(displayKeySequence.isEmpty ? "No keys recorded" : 
-                    displayKeySequence.map { $0.displayText }.joined(separator: ", "))
+                Text(stepsDisplayText)
+                    .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
-                    .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
+                    .truncationMode(.tail)
+                    .help(stepsDisplayText)
                     .contentShape(Rectangle())
                     .onTapGesture {
                         isRecordingSequence = true

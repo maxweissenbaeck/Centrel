@@ -329,7 +329,30 @@ class MacroController {
             return nil
         }
         
-        let newMacro = Macro(name: currentMacroName, keySequence: self.recordedKeys)
+        // Convert raw recordedKeys → logical MacroSteps
+        var steps: [MacroStep] = []
+        
+        // First pass: Extract only the key down events with their modifiers
+        var keyDownEvents: [MacroKey] = []
+        for key in recordedKeys {
+            if key.isPressed {
+                keyDownEvents.append(key)
+            }
+        }
+        
+        // Create a step for each key press individually
+        if !keyDownEvents.isEmpty {
+            for key in keyDownEvents {
+                if key.type == .mouse {
+                    steps.append(MacroStep(type: .mouse, keyCode: key.keyCode, modifiers: key.modifiers))
+                } else {
+                    steps.append(MacroStep(type: .key, keyCode: key.keyCode, modifiers: key.modifiers))
+                }
+            }
+        }
+        
+        // Always store the full raw key sequence for accurate execution
+        let newMacro = Macro(name: currentMacroName, keySequence: self.recordedKeys, steps: steps)
         currentMacroName = ""
         
         // Clear the callback
@@ -463,18 +486,97 @@ class MacroController {
     
     // Method 1: The standard CGEvent method we've been using, now using HID injection helper
     private func executeStandardMethod(_ macro: Macro) throws {
-        // Execute key events in the exact sequence they were recorded
-        for (index, key) in macro.keySequence.enumerated() {
-            if isDebugging {
-                logger.info("▶️ Executing: \(key.displayText) (\(key.isPressed ? "DOWN" : "UP"))")
+        // Execute steps in the logical sequence
+        for step in macro.steps {
+            switch step.type {
+                case .key:
+                    // HID inject key down+up with step.keyCode & step.modifiers
+                    if let keyCode = step.keyCode {
+                        // Create temporary MacroKey for key down
+                        let keyDown = MacroKey(type: .keyboard, keyCode: keyCode, modifiers: step.modifiers, isPressed: true)
+                        injectHIDEvent(for: keyDown)
+                        usleep(20000) // 20ms
+                        
+                        // Create temporary MacroKey for key up
+                        let keyUp = MacroKey(type: .keyboard, keyCode: keyCode, modifiers: step.modifiers, isPressed: false)
+                        injectHIDEvent(for: keyUp)
+                    }
+                case .mouse:
+                    // HID click with step.keyCode & step.modifiers
+                    if let buttonNumber = step.keyCode {
+                        // Create temporary MacroKey for mouse down
+                        let mouseDown = MacroKey(type: .mouse, keyCode: buttonNumber, modifiers: step.modifiers, isPressed: true)
+                        injectHIDEvent(for: mouseDown)
+                        usleep(20000) // 20ms
+                        
+                        // Create temporary MacroKey for mouse up
+                        let mouseUp = MacroKey(type: .mouse, keyCode: buttonNumber, modifiers: step.modifiers, isPressed: false)
+                        injectHIDEvent(for: mouseUp)
+                    }
+                case .text:
+                    // Loop through step.text characters, posting each
+                    if let text = step.text {
+                        for char in text {
+                            // Convert character to key events and inject
+                            let events = characterToKeyEvents(char, modifiers: step.modifiers)
+                            for event in events {
+                                injectHIDEvent(for: event)
+                                usleep(20000) // 20ms
+                            }
+                        }
+                    }
+                case .delay:
+                    usleep(UInt32((step.delay ?? 0.1) * 1_000_000))
             }
-            // Inject the event via HID tap (pure hardware event)
-            injectHIDEvent(for: key)
-            // Brief pause between events
+            
+            // Brief pause between steps
             usleep(20000) // 20ms
+        }
+        
+        // If no steps available (old macro), fall back to raw key sequence
+        if macro.steps.isEmpty, !macro.keySequence.isEmpty {
+            // Execute key events in the exact sequence they were recorded
+            for key in macro.keySequence {
+                if isDebugging {
+                    logger.info("▶️ Executing: \(key.displayText) (\(key.isPressed ? "DOWN" : "UP"))")
+                }
+                // Inject the event via HID tap (pure hardware event)
+                injectHIDEvent(for: key)
+                // Brief pause between events
+                usleep(20000) // 20ms
+            }
         }
     }
 
+    // Helper to convert a character to keyboard events
+    private func characterToKeyEvents(_ char: Character, modifiers: Int) -> [MacroKey] {
+        // This is a simplified implementation
+        // In a real app, you'd have a comprehensive mapping of characters to key codes and modifiers
+        let charString = String(char)
+        let uppercase = charString.uppercased()
+        let _ = charString == uppercase && charString != charString.lowercased()
+        
+        var events: [MacroKey] = []
+        var keyCode = 0
+        var mods = modifiers
+        
+        // Simple mapping for a-z
+        if let ascii = char.asciiValue, ascii >= 97 && ascii <= 122 {
+            keyCode = Int(ascii - 97)
+        } else if let ascii = char.asciiValue, ascii >= 65 && ascii <= 90 {
+            keyCode = Int(ascii - 65)
+            mods |= 1 // Add shift modifier
+        }
+        
+        // In a real implementation, you'd handle more characters
+        
+        // Create key down and key up events
+        events.append(MacroKey(type: .keyboard, keyCode: keyCode, modifiers: mods, isPressed: true))
+        events.append(MacroKey(type: .keyboard, keyCode: keyCode, modifiers: mods, isPressed: false))
+        
+        return events
+    }
+    
     /// Injects a HID-level keyboard event for the given MacroKey.
     private func injectHIDEvent(for key: MacroKey) {
         let src = CGEventSource(stateID: .hidSystemState)
@@ -939,16 +1041,32 @@ class MacroController {
     // Handle any key event - for both recording and trigger detection
     func handleKeyEvent(_ event: NSEvent) {
         let keyCode = event.keyCode
-        let modifiers = event.modifierFlags.rawValue
+        let rawModifiers = event.modifierFlags.rawValue
         let isKeyDown = event.type == .keyDown
+        
+        // Clean up the modifiers to remove any phantom controls
+        var cleanModifiers = Int(rawModifiers)
+        
+        // Filter out the Control modifier if it's not actually being pressed
+        // This helps eliminate the phantom Control key issue in logs
+        let controlIsActuallyPressed = event.modifierFlags.contains(.control) && 
+                                     currentlyPressedKeys.contains { 
+                                         $0.keyCode == 59 || $0.keyCode == 62 
+                                     }
+        
+        if !controlIsActuallyPressed && event.modifierFlags.contains(.control) {
+            // Remove the control bit (2) from modifiers if Control isn't actually pressed
+            cleanModifiers &= ~2
+        }
 
-        let macroKey = MacroKey(type: .keyboard, keyCode: Int(keyCode), modifiers: Int(modifiers), isPressed: isKeyDown)
+        let macroKey = MacroKey(type: .keyboard, keyCode: Int(keyCode), modifiers: cleanModifiers, isPressed: isKeyDown)
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
             // Log key event in debug mode
             if self.isDebugging {
+                // For debug logs, include more detailed information
                 self.logger.info("🔑 Key \(isKeyDown ? "DOWN" : "UP"): \(macroKey.displayText) (code: \(keyCode), modifiers: \(macroKey.modifiers))")
             }
 
@@ -1111,14 +1229,42 @@ class MacroController {
         
         // Process each changed modifier
         for (keyCode, isPressed) in changedModifiers {
-            let macroKey = MacroKey(type: .keyboard, keyCode: keyCode, modifiers: Int(event.modifierFlags.rawValue), isPressed: isPressed)
+            // Create a clean modifier bitmask for just this key
+            var cleanModifiers = 0
+            
+            // For the display and behavior, we want only the specific modifier
+            // that was pressed, not all active modifiers
+            switch keyCode {
+            case 56, 60: // Shift keys
+                cleanModifiers = 1 // Only Shift bit
+            case 59, 62: // Control keys
+                cleanModifiers = 2 // Only Control bit 
+            case 58, 61: // Option keys
+                cleanModifiers = 4 // Only Option bit
+            case 55, 54: // Command keys
+                cleanModifiers = 8 // Only Command bit
+            case 57: // Caps Lock
+                // No specific bit for caps lock in our system
+                break
+            case 63: // Function
+                // No specific bit for function in our system
+                break
+            default:
+                break
+            }
+            
+            // Create a MacroKey with only the specific modifier
+            let macroKey = MacroKey(type: .keyboard, keyCode: keyCode, modifiers: cleanModifiers, isPressed: isPressed)
             
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 
                 // Log modifier key event in debug mode
                 if self.isDebugging {
-                    self.logger.info("⌨️ Modifier \(isPressed ? "DOWN" : "UP"): \(macroKey.displayText)")
+                    // For debug logs, include the detailed "Left/Right" information
+                    let detailedDescription = (keyCode >= 54 && keyCode <= 62) ? 
+                        self.getDetailedModifierName(keyCode) : macroKey.displayText
+                    self.logger.info("⌨️ Modifier \(isPressed ? "DOWN" : "UP"): \(detailedDescription)")
                 }
                 
                 // Always record modifier events during recording, both down and up
@@ -1139,6 +1285,23 @@ class MacroController {
                     self.currentlyPressedKeys.removeAll { $0.keyCode == macroKey.keyCode && $0.type == .keyboard }
                 }
             }
+        }
+    }
+    
+    // Helper method to get detailed modifier key name with Left/Right for logging
+    private func getDetailedModifierName(_ keyCode: Int) -> String {
+        switch keyCode {
+        case 54: return "Right ⌘"
+        case 55: return "Left ⌘"
+        case 56: return "Left ⇧"
+        case 57: return "Caps Lock"
+        case 58: return "Left ⌥"
+        case 59: return "Left ⌃"
+        case 60: return "Right ⇧"
+        case 61: return "Right ⌥"
+        case 62: return "Right ⌃"
+        case 63: return "Function"
+        default: return "Key \(keyCode)"
         }
     }
     
